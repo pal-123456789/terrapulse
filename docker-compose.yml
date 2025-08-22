@@ -1,0 +1,103 @@
+
+services:
+  # --- PRIMARY DATABASE (PostGIS) ---
+  postgis:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: terrapulse-db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgis_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis for pub/sub and caching
+  redis:
+    image: redis:7-alpine
+    container_name: terrapulse-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Notification Service
+  notification-service:
+    build:
+      context: ./backend/notification-service
+      dockerfile: Dockerfile
+    ports:
+      - "8082:8082"
+    environment:
+      - REDIS_URL=redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- API GATEWAY (Go) ---
+  api-gateway:
+    build:
+      context: ./backend/api-gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - INGESTION_SERVICE_URL=http://ingestion-service:8081
+      - INFERENCE_SERVICE_URL=http://inference-service:8000
+    depends_on:
+      ingestion-service:
+        condition: service_started
+    restart: unless-stopped
+
+  # --- DATA INGESTION MICROSERVICE (Go) ---
+  ingestion-service:
+    build:
+      context: ./backend/ingestion-service
+      dockerfile: Dockerfile
+    environment:
+      - DB_CONN_STRING=host=postgis user=${POSTGRES_USER} password=${POSTGRES_PASSWORD} dbname=${POSTGRES_DB} sslmode=disable
+      - NASA_API_KEY=${NASA_API_KEY}
+    depends_on:
+      postgis:
+        condition: service_healthy
+
+  # --- AI INFERENCE MICROSERVICE (Python) ---
+  inference-service:
+    build:
+      context: ./ai/inference-service
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_PATH=/app/models/heuristic_rules.json
+
+  # --- FRONTEND (SvelteKit) ---
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8080
+    depends_on:
+      - api-gateway
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/package.json:/app/package.json
+
+volumes:
+  postgis_data:
